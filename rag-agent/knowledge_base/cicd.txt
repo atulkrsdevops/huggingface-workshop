@@ -1,0 +1,469 @@
+CI/CD for MLOps Guide
+=====================
+
+## Overview
+Continuous Integration and Continuous Deployment (CI/CD) for ML extends traditional software CI/CD with model training, evaluation, versioning, and deployment stages. The goal is automated, reproducible ML pipelines from code commit to production.
+
+## GitHub Actions for ML
+
+### ML Training Pipeline
+```yaml
+# .github/workflows/ml-pipeline.yml
+name: ML Training and Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'configs/**'
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly retraining
+
+env:
+  PYTHON_VERSION: '3.10'
+  MODEL_REGISTRY: ghcr.io/myorg/models
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+    - name: Run unit tests
+      run: pytest tests/unit/ -v --coverage
+    - name: Run data validation tests
+      run: pytest tests/data/ -v
+    - name: Lint code
+      run: |
+        flake8 src/
+        black --check src/
+
+  train:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    - name: Launch SageMaker training job
+      run: |
+        python scripts/launch_training.py \
+          --config configs/training_config.yaml \
+          --commit-hash ${{ github.sha }}
+    - name: Wait for training completion
+      run: python scripts/wait_for_training.py
+
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    outputs:
+      model_approved: ${{ steps.eval.outputs.approved }}
+    steps:
+    - name: Evaluate model
+      id: eval
+      run: |
+        ACCURACY=$(python scripts/evaluate_model.py)
+        echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
+        if (( $(echo "$ACCURACY > 0.85" | bc -l) )); then
+          echo "approved=true" >> $GITHUB_OUTPUT
+        else
+          echo "approved=false" >> $GITHUB_OUTPUT
+        fi
+
+  deploy-staging:
+    needs: evaluate
+    if: needs.evaluate.outputs.model_approved == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+    - name: Deploy to staging
+      run: python scripts/deploy_model.py --env staging
+    - name: Run integration tests
+      run: pytest tests/integration/ -v
+    - name: Run smoke tests against staging
+      run: python scripts/smoke_tests.py --endpoint staging-endpoint
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+    - name: Deploy to production (canary)
+      run: python scripts/deploy_model.py --env production --canary-weight 10
+    - name: Monitor canary for 30 minutes
+      run: python scripts/monitor_canary.py --duration 1800 --threshold 0.99
+    - name: Full production cutover
+      run: python scripts/deploy_model.py --env production --canary-weight 100
+```
+
+### Docker Build and Push for ML Images
+```yaml
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push training image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.training
+        push: true
+        tags: |
+          ghcr.io/myorg/ml-trainer:latest
+          ghcr.io/myorg/ml-trainer:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+## Jenkins for MLOps
+
+### Declarative Jenkinsfile
+```groovy
+pipeline {
+    agent { label 'ml-worker' }
+
+    parameters {
+        string(name: 'MODEL_VERSION', defaultValue: 'auto')
+        booleanParam(name: 'RUN_FULL_EVAL', defaultValue: false)
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        S3_BUCKET = 's3://my-ml-models'
+        MLFLOW_TRACKING_URI = 'http://mlflow-server:5000'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Data Validation') {
+            steps {
+                sh '''
+                    python -m great_expectations checkpoint run data_checkpoint
+                '''
+            }
+        }
+
+        stage('Feature Engineering') {
+            steps {
+                sh 'python src/features/build_features.py'
+            }
+        }
+
+        stage('Model Training') {
+            steps {
+                withAWS(region: "${AWS_REGION}", credentials: 'aws-ml-credentials') {
+                    sh '''
+                        python src/models/train_model.py \
+                            --config configs/model_config.yaml \
+                            --mlflow-run-name jenkins-${BUILD_NUMBER}
+                    '''
+                }
+            }
+        }
+
+        stage('Model Evaluation') {
+            steps {
+                sh 'python src/models/evaluate_model.py'
+                script {
+                    def accuracy = sh(
+                        script: 'cat metrics/accuracy.txt',
+                        returnStdout: true
+                    ).trim().toFloat()
+
+                    if (accuracy < 0.85) {
+                        error("Model accuracy ${accuracy} below threshold 0.85")
+                    }
+                    echo "Model accuracy: ${accuracy}"
+                }
+            }
+        }
+
+        stage('Register Model') {
+            when { branch 'main' }
+            steps {
+                sh '''
+                    python src/models/register_model.py \
+                        --model-name my-classification-model \
+                        --stage Staging
+                '''
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when { branch 'main' }
+            steps {
+                sh 'kubectl apply -f k8s/staging/ --namespace ml-staging'
+                sh 'kubectl rollout status deployment/ml-model -n ml-staging --timeout=300s'
+            }
+        }
+
+        stage('Integration Tests') {
+            when { branch 'main' }
+            steps {
+                sh 'pytest tests/integration/ --endpoint staging-api'
+            }
+        }
+
+        stage('Deploy to Production') {
+            when { branch 'main' }
+            input { message 'Approve production deployment?' }
+            steps {
+                sh 'kubectl apply -f k8s/production/ --namespace ml-production'
+                sh 'kubectl rollout status deployment/ml-model -n ml-production --timeout=600s'
+            }
+        }
+    }
+
+    post {
+        always {
+            publishHTML([
+                reportDir: 'reports/',
+                reportFiles: 'model_evaluation.html',
+                reportName: 'Model Evaluation Report'
+            ])
+        }
+        failure {
+            slackSend channel: '#ml-alerts', message: "ML Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+        success {
+            slackSend channel: '#ml-deploys', message: "ML Pipeline SUCCESS: Model v${params.MODEL_VERSION} deployed"
+        }
+    }
+}
+```
+
+## ArgoCD and GitOps for MLOps
+
+### GitOps Workflow
+In GitOps, the desired state of infrastructure and deployments is defined in Git. ArgoCD continuously syncs the cluster state to match the Git repository.
+
+```bash
+# Install ArgoCD
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Create ArgoCD Application for ML serving
+argocd app create ml-serving \
+  --repo https://github.com/myorg/ml-gitops \
+  --path k8s/ml-serving \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace ml-serving \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal
+```
+
+### ArgoCD Application Manifest
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ml-serving
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/myorg/ml-gitops
+    targetRevision: HEAD
+    path: k8s/ml-serving
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ml-serving
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+  revisionHistoryLimit: 10
+```
+
+### Argo Workflows for ML Pipelines
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: ml-training-workflow
+spec:
+  entrypoint: ml-pipeline
+  templates:
+  - name: ml-pipeline
+    dag:
+      tasks:
+      - name: preprocess
+        template: preprocess-data
+      - name: train
+        template: train-model
+        dependencies: [preprocess]
+        arguments:
+          parameters:
+          - name: data-path
+            value: "{{tasks.preprocess.outputs.parameters.output-path}}"
+      - name: evaluate
+        template: evaluate-model
+        dependencies: [train]
+      - name: register
+        template: register-model
+        dependencies: [evaluate]
+        when: "{{tasks.evaluate.outputs.parameters.accuracy}} > 0.85"
+
+  - name: preprocess-data
+    container:
+      image: my-registry/ml-preprocessor:latest
+      command: [python, preprocess.py]
+    outputs:
+      parameters:
+      - name: output-path
+        valueFrom:
+          path: /tmp/output-path.txt
+
+  - name: train-model
+    inputs:
+      parameters:
+      - name: data-path
+    container:
+      image: my-registry/ml-trainer:latest
+      command: [python, train.py, --data-path, "{{inputs.parameters.data-path}}"]
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+```
+
+## DVC (Data Version Control) Integration
+
+```bash
+# Initialize DVC in your repo
+dvc init
+dvc remote add -d s3remote s3://my-bucket/dvc-store
+git add .dvc/config
+git commit -m "Configure DVC remote"
+
+# Track datasets and models
+dvc add data/raw/training_data.csv
+dvc add models/my_model.pkl
+git add data/raw/training_data.csv.dvc models/my_model.pkl.dvc
+git commit -m "Track dataset and model with DVC"
+git push && dvc push
+
+# Define a DVC pipeline
+dvc run -n preprocess \
+  -d src/preprocess.py -d data/raw/training_data.csv \
+  -o data/processed/features.csv \
+  python src/preprocess.py
+
+dvc run -n train \
+  -d src/train.py -d data/processed/features.csv \
+  -o models/my_model.pkl \
+  -m metrics/train_metrics.json \
+  python src/train.py
+```
+
+## MLflow CI/CD Integration
+
+```python
+import mlflow
+import mlflow.sklearn
+from mlflow.tracking import MlflowClient
+
+# Log training run
+with mlflow.start_run(run_name=f"ci-build-{os.environ.get('BUILD_NUMBER')}") as run:
+    mlflow.log_param("learning_rate", 0.01)
+    mlflow.log_param("n_estimators", 100)
+    mlflow.sklearn.log_model(model, "model")
+    mlflow.log_metric("accuracy", accuracy)
+    mlflow.log_metric("f1_score", f1)
+
+    run_id = run.info.run_id
+
+# Register model in Model Registry
+client = MlflowClient()
+model_uri = f"runs:/{run_id}/model"
+mv = mlflow.register_model(model_uri, "MyMLModel")
+
+# Transition to staging
+client.transition_model_version_stage(
+    name="MyMLModel",
+    version=mv.version,
+    stage="Staging",
+    archive_existing_versions=False
+)
+```
+
+## Testing Strategy for ML CI/CD
+
+### Data Tests
+```python
+# tests/data/test_data_quality.py
+import great_expectations as gx
+
+def test_data_schema():
+    context = gx.get_context()
+    results = context.run_checkpoint(checkpoint_name="training_data_checkpoint")
+    assert results.success, f"Data validation failed: {results}"
+
+def test_feature_distributions():
+    df = pd.read_csv("data/processed/features.csv")
+    assert df['age'].between(0, 120).all(), "Age values out of valid range"
+    assert df.isnull().sum().sum() == 0, "Null values detected in features"
+```
+
+### Model Tests
+```python
+# tests/model/test_model_behavior.py
+def test_model_output_shape(trained_model, test_data):
+    predictions = trained_model.predict(test_data)
+    assert predictions.shape[0] == len(test_data)
+
+def test_model_prediction_range(trained_model, test_data):
+    probabilities = trained_model.predict_proba(test_data)
+    assert (probabilities >= 0).all() and (probabilities <= 1).all()
+
+def test_model_determinism(trained_model, test_sample):
+    pred1 = trained_model.predict(test_sample)
+    pred2 = trained_model.predict(test_sample)
+    np.testing.assert_array_equal(pred1, pred2)
+
+def test_model_performance_regression(trained_model, holdout_data, holdout_labels):
+    accuracy = trained_model.score(holdout_data, holdout_labels)
+    PERFORMANCE_THRESHOLD = 0.85
+    assert accuracy >= PERFORMANCE_THRESHOLD, f"Model degraded: {accuracy} < {PERFORMANCE_THRESHOLD}"
+```
+
+## Best Practices
+
+1. Treat model training configuration as code and version it in Git
+2. Automate data validation before every training run
+3. Use model registries (MLflow, SageMaker Registry) as the source of truth for production models
+4. Never deploy a model directly — always promote through staging → production
+5. Log all hyperparameters and metrics for every training run
+6. Version datasets alongside models (use DVC or data versioning tools)
+7. Implement canary deployments and A/B testing for model updates
+8. Run automated regression tests against a holdout set on every PR
+9. Gate production deployments on human approval for high-risk models
+10. Monitor CI/CD pipeline performance and optimize bottlenecks

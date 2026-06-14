@@ -1,0 +1,395 @@
+AWS SageMaker MLOps Guide
+=========================
+
+## Overview
+Amazon SageMaker is a fully managed machine learning service that enables data scientists and developers to build, train, and deploy ML models at scale. It provides integrated tools for the entire ML lifecycle.
+
+## SageMaker Training Jobs
+
+### Configuring a Training Job
+To launch a training job in SageMaker, you define an Estimator with the algorithm, instance type, hyperparameters, and data channels. SageMaker pulls data from S3, runs training on managed infrastructure, and saves model artifacts back to S3.
+
+```python
+from sagemaker.estimator import Estimator
+
+estimator = Estimator(
+    image_uri="763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.0.0-gpu-py310",
+    role="arn:aws:iam::account:role/SageMakerRole",
+    instance_count=1,
+    instance_type="ml.p3.2xlarge",
+    volume_size=50,
+    max_run=3600,
+    output_path="s3://my-bucket/output/",
+    hyperparameters={"epochs": 10, "learning_rate": 0.001}
+)
+
+estimator.fit({"train": "s3://my-bucket/train/", "validation": "s3://my-bucket/val/"})
+```
+
+### Spot Instance Training
+SageMaker supports Managed Spot Training which can reduce training costs by up to 90%. Use `use_spot_instances=True` and set `max_wait` for the timeout.
+
+```python
+estimator = Estimator(
+    ...
+    use_spot_instances=True,
+    max_run=3600,
+    max_wait=7200,
+    checkpoint_s3_uri="s3://my-bucket/checkpoints/"
+)
+```
+
+### Distributed Training
+SageMaker supports data parallelism (SageMaker Distributed Data Parallel - SMDDP) and model parallelism (SageMaker Distributed Model Parallel - SMDMP) for large-scale training. Set `distribution` parameter in the Estimator.
+
+## Hyperparameter Tuning (HPO)
+
+SageMaker Automatic Model Tuning (AMT) uses Bayesian optimization, random search, or Hyperband to find optimal hyperparameters.
+
+```python
+from sagemaker.tuner import HyperparameterTuner, IntegerParameter, ContinuousParameter
+
+tuner = HyperparameterTuner(
+    estimator=estimator,
+    objective_metric_name="validation:accuracy",
+    hyperparameter_ranges={
+        "learning_rate": ContinuousParameter(0.0001, 0.1),
+        "batch_size": IntegerParameter(16, 256),
+        "epochs": IntegerParameter(5, 50)
+    },
+    max_jobs=20,
+    max_parallel_jobs=4,
+    strategy="Bayesian"
+)
+tuner.fit({"train": train_data, "validation": val_data})
+```
+
+## Model Deployment
+
+### Real-Time Inference Endpoints
+Deploy models to persistent HTTPS endpoints for low-latency, real-time predictions.
+
+```python
+predictor = estimator.deploy(
+    initial_instance_count=1,
+    instance_type="ml.m5.xlarge",
+    endpoint_name="my-model-endpoint"
+)
+
+# Invoke endpoint
+result = predictor.predict(data)
+```
+
+### Auto-Scaling Endpoints
+Configure auto-scaling to handle variable traffic loads.
+
+```python
+import boto3
+
+client = boto3.client("application-autoscaling")
+client.register_scalable_target(
+    ServiceNamespace="sagemaker",
+    ResourceId="endpoint/my-model-endpoint/variant/AllTraffic",
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    MinCapacity=1,
+    MaxCapacity=10
+)
+client.put_scaling_policy(
+    PolicyName="ScalePolicy",
+    ResourceId="endpoint/my-model-endpoint/variant/AllTraffic",
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    ServiceNamespace="sagemaker",
+    PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        "TargetValue": 70.0,
+        "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"
+        }
+    }
+)
+```
+
+### Serverless Inference
+For intermittent workloads with no minimum cost. SageMaker allocates compute on demand.
+
+```python
+from sagemaker.serverless import ServerlessInferenceConfig
+
+serverless_config = ServerlessInferenceConfig(
+    memory_size_in_mb=2048,
+    max_concurrency=10
+)
+predictor = model.deploy(serverless_inference_config=serverless_config)
+```
+
+### Batch Transform
+Process large datasets offline without a persistent endpoint.
+
+```python
+transformer = estimator.transformer(
+    instance_count=1,
+    instance_type="ml.m5.xlarge",
+    output_path="s3://my-bucket/batch-output/"
+)
+transformer.transform(
+    data="s3://my-bucket/batch-input/",
+    content_type="text/csv",
+    split_type="Line"
+)
+```
+
+### Multi-Model Endpoints (MME)
+Host thousands of models behind a single endpoint to reduce costs.
+
+```python
+from sagemaker.multidatamodel import MultiDataModel
+
+mme = MultiDataModel(
+    name="multi-model-endpoint",
+    model_data_prefix="s3://my-bucket/models/",
+    model=model,
+    sagemaker_session=session
+)
+mme.deploy(initial_instance_count=1, instance_type="ml.m5.xlarge")
+mme.add_model(model_data_source="s3://my-bucket/models/model_v1.tar.gz", model_data_path="model_v1.tar.gz")
+```
+
+## Auto Scaling for SageMaker Endpoints
+
+Auto Scaling dynamically adjusts the number of instances serving an endpoint in response to real-time traffic, balancing performance and cost without manual intervention. It is implemented through AWS Application Auto Scaling integrated with SageMaker.
+
+### Target Tracking Scaling Policies
+
+Target tracking is the recommended policy type for SageMaker endpoints. You declare a target metric value, and Application Auto Scaling continuously adds or removes instances to keep the metric at that value. When observed metric > target, scale out; when observed metric < target and scale-in is not disabled, scale in.
+
+SageMaker exposes one predefined metric purpose-built for this:
+
+- **SageMakerVariantInvocationsPerInstance** — invocations per minute per instance for a specific endpoint variant. This is the primary metric used for right-sizing throughput capacity.
+
+You can also define custom CloudWatch metrics (e.g., GPU utilization, queue depth) via `CustomizedMetricSpecification` for workloads with unusual scaling signals.
+
+### Scaling Based on InvocationsPerInstance
+
+`SageMakerVariantInvocationsPerInstance` is computed as:
+
+    total invocations per minute ÷ current instance count
+
+Set `TargetValue` to the per-instance request rate your model can serve at your latency SLA with comfortable headroom—typically 60–75% of the maximum you measured during load testing. If your model handles 800 req/min per instance at acceptable latency, a `TargetValue` of 500–600 is a safe target.
+
+### Min/Max Instance Count Configuration
+
+Register the endpoint variant as a scalable target and specify bounds:
+
+- **MinCapacity**: Minimum instances at all times. Must be ≥ 1 for real-time endpoints. Set based on baseline traffic and cold-start latency tolerance.
+- **MaxCapacity**: Upper bound on instance count. Caps cost exposure during traffic spikes. Set based on peak load projections and budget.
+
+Auto Scaling never crosses these bounds regardless of how far the metric deviates from target.
+
+### Cooldown Periods
+
+Cooldown periods prevent thrashing—rapid alternating scale-out and scale-in events:
+
+- **ScaleOutCooldown**: Seconds to wait after a scale-out completes before another scale-out action can fire. Lower values (60–120 s) suit latency-sensitive endpoints that need fast capacity addition.
+- **ScaleInCooldown**: Seconds to wait after a scale-in completes before another scale-in fires. Higher values (300–600 s) prevent premature removal of instances after a traffic spike subsides.
+
+Both default to 300 seconds if omitted. Set `DisableScaleIn: True` to allow the policy to scale out but never scale in automatically (useful for endpoints with bursty-but-unpredictable traffic).
+
+### Code Example: Register Scalable Target and Put Scaling Policy
+
+```python
+import boto3
+
+autoscaling = boto3.client("application-autoscaling", region_name="us-east-1")
+
+endpoint_name = "my-model-endpoint"
+variant_name  = "AllTraffic"
+resource_id   = f"endpoint/{endpoint_name}/variant/{variant_name}"
+
+# Step 1: Register the endpoint variant as a scalable target
+autoscaling.register_scalable_target(
+    ServiceNamespace="sagemaker",
+    ResourceId=resource_id,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    MinCapacity=1,   # never drop below 1 instance
+    MaxCapacity=8,   # never exceed 8 instances
+)
+
+# Step 2: Attach a target tracking policy on InvocationsPerInstance
+response = autoscaling.put_scaling_policy(
+    PolicyName="invocations-target-tracking-policy",
+    ServiceNamespace="sagemaker",
+    ResourceId=resource_id,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        # Scale to keep each instance handling ~500 req/min
+        "TargetValue": 500.0,
+        "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"
+        },
+        "ScaleOutCooldown": 60,   # add capacity quickly on traffic spike
+        "ScaleInCooldown": 300,   # wait 5 min before removing instances
+        "DisableScaleIn": False,  # allow automated scale-in
+    },
+)
+print("Policy ARN:", response["PolicyARN"])
+
+# Step 3 (optional): Inspect or remove configuration
+policies = autoscaling.describe_scaling_policies(
+    ServiceNamespace="sagemaker",
+    ResourceId=resource_id,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+)
+for p in policies["ScalingPolicies"]:
+    print(p["PolicyName"], p["PolicyType"])
+
+# Deregister removes the scalable target and all attached policies
+autoscaling.deregister_scalable_target(
+    ServiceNamespace="sagemaker",
+    ResourceId=resource_id,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+)
+```
+
+### Auto Scaling Best Practices
+
+1. Load-test before setting `TargetValue`; use 60–70% of measured per-instance max throughput as the target.
+2. Set `ScaleOutCooldown` low (60–120 s) for latency-sensitive APIs; set `ScaleInCooldown` high (300–600 s) to avoid over-eager scale-in.
+3. Set `MinCapacity ≥ 2` for production endpoints to avoid single-instance cold-start gaps during scale-out.
+4. Pair Auto Scaling with CloudWatch alarms on `ModelLatency` and `OverheadLatency` to catch cases where new instances haven't warmed up yet.
+5. Use `DisableScaleIn: True` for endpoints with unpredictable bursty traffic where the cost of a cold instance is high.
+6. After scaling events, check `DesiredInstanceCount` vs `CurrentInstanceCount` in CloudWatch to ensure instances are launching within expected time.
+
+## SageMaker Pipelines
+
+SageMaker Pipelines is a purpose-built CI/CD service for ML. It enables automated, repeatable ML workflows.
+
+```python
+from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep, RegisterModel
+from sagemaker.workflow.parameters import ParameterFloat, ParameterString
+
+# Define pipeline parameters
+model_approval_status = ParameterString(name="ModelApprovalStatus", default_value="PendingManualApproval")
+accuracy_threshold = ParameterFloat(name="AccuracyThreshold", default_value=0.85)
+
+# Define steps
+preprocessing_step = ProcessingStep(name="Preprocessing", processor=processor, ...)
+training_step = TrainingStep(name="Training", estimator=estimator, ...)
+register_step = RegisterModel(name="RegisterModel", estimator=estimator, ...)
+
+# Create and run pipeline
+pipeline = Pipeline(
+    name="MLOpsPipeline",
+    parameters=[model_approval_status, accuracy_threshold],
+    steps=[preprocessing_step, training_step, register_step]
+)
+pipeline.upsert(role_arn=role)
+execution = pipeline.start()
+```
+
+### Conditional Steps
+Use condition steps to implement branching logic based on metrics.
+
+```python
+from sagemaker.workflow.condition_step import ConditionStep
+from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
+
+accuracy_condition = ConditionGreaterThanOrEqualTo(
+    left=JsonGet(step_name="Evaluation", property_file=evaluation_report, json_path="metrics.accuracy.value"),
+    right=accuracy_threshold
+)
+condition_step = ConditionStep(
+    name="CheckAccuracy",
+    conditions=[accuracy_condition],
+    if_steps=[register_step],
+    else_steps=[fail_step]
+)
+```
+
+## SageMaker Feature Store
+
+Centralized repository for storing, retrieving, and sharing ML features.
+
+```python
+from sagemaker.feature_store.feature_group import FeatureGroup
+
+feature_group = FeatureGroup(name="customer-features", sagemaker_session=session)
+feature_group.load_feature_definitions(data_frame=df)
+feature_group.create(
+    s3_uri="s3://my-bucket/feature-store/",
+    record_identifier_name="customer_id",
+    event_time_feature_name="event_time",
+    role_arn=role,
+    enable_online_store=True
+)
+feature_group.ingest(data_frame=df, max_workers=3, wait=True)
+
+# Query offline store
+query = feature_group.athena_query()
+query.run(query_string="SELECT * FROM customer_features", output_location="s3://my-bucket/athena-output/")
+```
+
+## SageMaker Model Monitor
+
+Automatically monitor ML models in production for data quality, model quality, bias drift, and feature attribution drift.
+
+```python
+from sagemaker.model_monitor import DataCaptureConfig, DefaultModelMonitor
+
+# Enable data capture
+data_capture_config = DataCaptureConfig(
+    enable_capture=True,
+    sampling_percentage=100,
+    destination_s3_uri="s3://my-bucket/data-capture/"
+)
+
+# Create monitor
+monitor = DefaultModelMonitor(role=role, instance_count=1, instance_type="ml.m5.xlarge")
+monitor.suggest_baseline(baseline_dataset="s3://my-bucket/baseline/", dataset_format={"csv": {"header": True}})
+monitor.create_monitoring_schedule(
+    monitor_schedule_name="my-monitor",
+    endpoint_input=predictor.endpoint_name,
+    statistics=monitor.baseline_statistics(),
+    constraints=monitor.suggested_constraints(),
+    schedule_cron_expression="cron(0 * ? * * *)"
+)
+```
+
+## SageMaker Clarify
+
+Detect bias in ML models and explain predictions.
+
+```python
+from sagemaker.clarify import SageMakerClarifyProcessor, BiasConfig, ExplainabilityConfig
+
+clarify_processor = SageMakerClarifyProcessor(role=role, instance_count=1, instance_type="ml.m5.xlarge")
+bias_config = BiasConfig(label_values_or_threshold=[1], facet_name="gender", facet_values_or_threshold=["female"])
+clarify_processor.run_bias(data_config=data_config, bias_config=bias_config, model_config=model_config)
+```
+
+## SageMaker Experiments
+
+Track ML experiments, compare models, and manage metadata.
+
+```python
+import sagemaker.experiments
+
+with sagemaker.experiments.load_run(experiment_name="my-experiment", run_name="run-1", sagemaker_session=session) as run:
+    run.log_parameter("learning_rate", 0.01)
+    run.log_metric("accuracy", 0.95, step=10)
+    run.log_artifact("model", "s3://my-bucket/model.tar.gz")
+```
+
+## Best Practices
+
+1. Use S3 as data lake; organize by project/version/date
+2. Tag all SageMaker resources for cost allocation
+3. Use lifecycle configurations to auto-shutdown idle notebooks
+4. Enable VPC mode for network isolation
+5. Use IAM roles with least privilege
+6. Enable encryption at rest using KMS
+7. Use spot instances for training (70-90% savings)
+8. Implement model registry with approval workflows
+9. Monitor endpoint costs and set billing alarms
+10. Use SageMaker Experiments for reproducibility

@@ -1,0 +1,437 @@
+Kubernetes for MLOps Guide
+==========================
+
+## Overview
+Kubernetes (K8s) is the de facto standard for container orchestration in MLOps. It provides automated deployment, scaling, and management of containerized ML workloads, enabling reproducible and scalable ML systems.
+
+## Core Kubernetes Concepts for ML
+
+### Pods
+The smallest deployable unit. A pod runs one or more containers sharing network and storage.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-inference-pod
+  labels:
+    app: ml-inference
+spec:
+  containers:
+  - name: model-server
+    image: my-registry/model-server:v1.2
+    ports:
+    - containerPort: 8080
+    resources:
+      requests:
+        memory: "4Gi"
+        cpu: "2"
+        nvidia.com/gpu: "1"
+      limits:
+        memory: "8Gi"
+        cpu: "4"
+        nvidia.com/gpu: "1"
+    env:
+    - name: MODEL_PATH
+      value: "/models/my-model"
+    volumeMounts:
+    - name: model-storage
+      mountPath: /models
+  volumes:
+  - name: model-storage
+    persistentVolumeClaim:
+      claimName: model-pvc
+```
+
+### Deployments
+Deployments manage replica sets for stateless applications like ML inference servers.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-inference-deployment
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ml-inference
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: ml-inference
+        version: "1.2"
+    spec:
+      containers:
+      - name: model-server
+        image: my-registry/model-server:v1.2
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+```
+
+### Services
+Expose deployments within the cluster or externally.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-inference-service
+spec:
+  selector:
+    app: ml-inference
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: LoadBalancer
+```
+
+### ConfigMaps and Secrets
+Store model configuration and credentials separately from container images.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-config
+data:
+  model_version: "1.2.0"
+  batch_size: "32"
+  timeout_seconds: "30"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-credentials
+type: Opaque
+stringData:
+  aws_access_key_id: "AKIAIOSFODNN7EXAMPLE"
+  aws_secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+```
+
+## Horizontal Pod Autoscaler (HPA)
+
+Automatically scale deployments based on CPU, memory, or custom metrics like inference requests per second.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ml-inference-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ml-inference-deployment
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: inference_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "100"
+```
+
+## KEDA (Kubernetes Event-Driven Autoscaling)
+
+Scale to zero and back based on queue length or other external metrics.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ml-batch-scaler
+spec:
+  scaleTargetRef:
+    name: ml-batch-processor
+  minReplicaCount: 0
+  maxReplicaCount: 50
+  triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/123456/ml-job-queue
+      queueLength: "5"
+      awsRegion: us-east-1
+```
+
+## GPU Resource Management
+
+### Node Taints and Tolerations
+Ensure GPU workloads run only on GPU nodes.
+
+```yaml
+# GPU node taint (applied to node)
+kubectl taint nodes gpu-node-1 nvidia.com/gpu=true:NoSchedule
+
+# Pod toleration
+spec:
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-tesla-v100
+```
+
+### GPU Resource Requests
+Always set GPU requests equal to limits (GPUs are not over-committed).
+
+```yaml
+resources:
+  requests:
+    nvidia.com/gpu: "2"
+  limits:
+    nvidia.com/gpu: "2"
+```
+
+## Kubeflow
+
+Kubeflow is the ML toolkit for Kubernetes, providing components for the full ML lifecycle.
+
+### Kubeflow Pipelines
+Define and run multi-step ML workflows as DAGs.
+
+```python
+import kfp
+from kfp import dsl
+
+@dsl.component(base_image="python:3.10")
+def preprocess_data(data_path: str, output_path: str):
+    # Data preprocessing logic
+    pass
+
+@dsl.component(base_image="python:3.10")
+def train_model(data_path: str, model_output: str, epochs: int):
+    # Training logic
+    pass
+
+@dsl.pipeline(name="ml-training-pipeline")
+def ml_pipeline(data_path: str = "gs://my-bucket/data"):
+    preprocess_task = preprocess_data(data_path=data_path, output_path="/tmp/processed")
+    train_task = train_model(
+        data_path=preprocess_task.outputs["output_path"],
+        model_output="/tmp/model",
+        epochs=10
+    )
+    train_task.after(preprocess_task)
+
+# Compile and submit
+kfp.compiler.Compiler().compile(ml_pipeline, "pipeline.yaml")
+client = kfp.Client(host="http://kubeflow-pipelines:80")
+run = client.create_run_from_pipeline_func(ml_pipeline, arguments={})
+```
+
+### Katib (Hyperparameter Tuning)
+Kubernetes-native HPO using Bayesian optimization, grid search, and random search.
+
+```yaml
+apiVersion: kubeflow.org/v1beta1
+kind: Experiment
+metadata:
+  name: hyperparameter-tuning
+spec:
+  objective:
+    type: maximize
+    goal: 0.99
+    objectiveMetricName: accuracy
+  algorithm:
+    algorithmName: bayesianoptimization
+  parallelTrialCount: 3
+  maxTrialCount: 12
+  parameters:
+  - name: lr
+    parameterType: double
+    feasibleSpace:
+      min: "0.01"
+      max: "0.1"
+  - name: batch_size
+    parameterType: int
+    feasibleSpace:
+      min: "16"
+      max: "128"
+```
+
+### KServe (formerly KFServing)
+Production-grade model serving on Kubernetes.
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: sklearn-classifier
+spec:
+  predictor:
+    sklearn:
+      storageUri: "s3://my-bucket/sklearn-model/"
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+  transformer:
+    containers:
+    - name: transformer
+      image: my-registry/feature-transformer:latest
+  explainer:
+    alibi:
+      type: AnchorTabular
+      storageUri: "s3://my-bucket/explainer/"
+```
+
+## Namespace Organization for ML
+
+```yaml
+# Namespaces for ML workloads
+kubectl create namespace ml-training    # Training jobs
+kubectl create namespace ml-serving     # Inference endpoints
+kubectl create namespace ml-monitoring  # Monitoring tools
+kubectl create namespace ml-pipelines   # Workflow orchestration
+
+# Resource quotas per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-training-quota
+  namespace: ml-training
+spec:
+  hard:
+    requests.cpu: "100"
+    requests.memory: 200Gi
+    requests.nvidia.com/gpu: "8"
+    limits.nvidia.com/gpu: "8"
+    pods: "50"
+```
+
+## Helm Charts for ML Infrastructure
+
+```bash
+# Install Kubeflow Pipelines
+helm repo add kubeflow https://kubeflow.github.io/helm-charts
+helm install kubeflow-pipelines kubeflow/kubeflow-pipelines --namespace kubeflow
+
+# Install NVIDIA GPU Operator
+helm repo add nvidia https://nvidia.github.io/gpu-operator
+helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator --create-namespace
+
+# Install Prometheus + Grafana monitoring stack
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace
+```
+
+## Persistent Volume Claims for Models
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage-pvc
+  namespace: ml-serving
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods can read
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: efs-sc  # Use EFS for multi-read on AWS
+```
+
+## Network Policies for ML Security
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ml-serving-network-policy
+  namespace: ml-serving
+spec:
+  podSelector:
+    matchLabels:
+      app: ml-inference
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: api-gateway
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: ml-monitoring
+```
+
+## Ingress for ML Services
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-api-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  rules:
+  - host: ml-api.company.com
+    http:
+      paths:
+      - path: /predict
+        pathType: Prefix
+        backend:
+          service:
+            name: ml-inference-service
+            port:
+              number: 80
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: ml-inference-service
+            port:
+              number: 80
+```
+
+## Best Practices
+
+1. Always set resource requests and limits; never run unbounded pods
+2. Use liveness and readiness probes for all serving pods
+3. Implement rolling updates with maxSurge/maxUnavailable to avoid downtime
+4. Use namespaces to separate training, serving, and monitoring workloads
+5. Store models in shared storage (EFS, GCS, Azure Blob) not inside container images
+6. Apply node affinity rules to route GPU jobs to GPU nodes
+7. Use PodDisruptionBudgets to maintain availability during node maintenance
+8. Implement RBAC for least-privilege access
+9. Use Helm charts for repeatable deployments
+10. Monitor GPU utilization with DCGM exporter and Prometheus

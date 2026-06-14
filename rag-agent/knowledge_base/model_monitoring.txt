@@ -1,0 +1,371 @@
+Model Monitoring and Observability Guide
+=========================================
+
+## Overview
+Model monitoring ensures that ML models in production continue to perform as expected over time. Models degrade due to data drift (input distribution changes), concept drift (relationship between inputs and outputs changes), and infrastructure issues. A robust monitoring system detects these problems early and triggers alerts or automated retraining.
+
+## Types of Model Drift
+
+### Data Drift (Covariate Shift)
+The input feature distribution changes between training and serving time.
+
+```python
+# Detecting data drift with Evidently AI
+from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset, DataQualityPreset
+
+report = Report(metrics=[DataDriftPreset(), DataQualityPreset()])
+report.run(reference_data=training_data, current_data=production_data)
+report.save_html("data_drift_report.html")
+
+# Check if drift was detected
+result = report.as_dict()
+for metric in result['metrics']:
+    if metric['metric'] == 'DataDriftTable':
+        drifted_features = [
+            col for col, stats in metric['result']['drift_by_columns'].items()
+            if stats['drift_detected']
+        ]
+        print(f"Drifted features: {drifted_features}")
+```
+
+### Concept Drift
+The relationship P(y|X) changes — the model's predictions become incorrect even when inputs look normal.
+
+```python
+from evidently.metric_preset import TargetDriftPreset
+
+# Monitor target distribution drift
+target_report = Report(metrics=[TargetDriftPreset()])
+target_report.run(
+    reference_data=training_data[['features', 'target']],
+    current_data=production_data[['features', 'target']]
+)
+```
+
+### Prediction Drift
+The distribution of model outputs shifts, indicating the model is seeing different types of inputs.
+
+```python
+from evidently.metrics import ColumnDriftMetric
+
+prediction_drift_report = Report(metrics=[
+    ColumnDriftMetric(column_name="prediction"),
+    ColumnDriftMetric(column_name="prediction_confidence")
+])
+```
+
+## Alibi Detect for Drift Detection
+
+```python
+import alibi_detect
+from alibi_detect.cd import KSDrift, MMDDrift, ChiSquareDrift
+from alibi_detect.cd import TabularDrift
+import numpy as np
+
+# Kolmogorov-Smirnov test for continuous features
+ks_detector = KSDrift(
+    x_ref=X_train,
+    p_val=0.05,
+    preprocess_fn=None
+)
+result = ks_detector.predict(X_production, drift_type='batch', return_p_val=True)
+print(f"Drift detected: {result['data']['is_drift']}")
+print(f"P-values per feature: {result['data']['p_val']}")
+
+# Maximum Mean Discrepancy for complex distributions
+mmd_detector = MMDDrift(
+    x_ref=X_train,
+    backend='pytorch',
+    p_val=0.05,
+    n_permutations=100
+)
+
+# Combined tabular drift (handles mixed types)
+tabular_detector = TabularDrift(
+    x_ref=X_train,
+    p_val=0.05,
+    categories_per_feature={0: None, 1: None, 2: 3, 3: 5}  # feature_idx: n_categories (None = continuous)
+)
+
+# Save detector
+from alibi_detect.utils.saving import save_detector, load_detector
+save_detector(ks_detector, './ks_detector')
+loaded_detector = load_detector('./ks_detector')
+```
+
+## Prometheus and Grafana for ML Metrics
+
+### Custom Metrics with prometheus-client
+```python
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import time
+
+# Define metrics
+inference_requests = Counter('ml_inference_requests_total', 'Total inference requests', ['model_version', 'status'])
+inference_latency = Histogram('ml_inference_duration_seconds', 'Inference request latency',
+                               buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
+model_confidence = Histogram('ml_prediction_confidence', 'Model prediction confidence scores',
+                              buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+data_drift_score = Gauge('ml_data_drift_score', 'Current data drift score per feature', ['feature_name'])
+active_model_version = Gauge('ml_active_model_version', 'Currently active model version')
+
+# Instrumented prediction function
+def predict_with_monitoring(request_data):
+    start_time = time.time()
+    try:
+        result = model.predict(request_data)
+        confidence = float(result['confidence'])
+
+        # Record metrics
+        inference_requests.labels(model_version="1.2", status="success").inc()
+        inference_latency.observe(time.time() - start_time)
+        model_confidence.observe(confidence)
+
+        # Alert on low confidence
+        if confidence < 0.6:
+            low_confidence_predictions.inc()
+
+        return result
+    except Exception as e:
+        inference_requests.labels(model_version="1.2", status="error").inc()
+        raise
+
+# Start metrics server
+start_http_server(8000)
+```
+
+### Grafana Dashboard for ML Models
+```json
+{
+  "dashboard": {
+    "title": "ML Model Monitoring",
+    "panels": [
+      {
+        "title": "Inference Requests per Second",
+        "type": "graph",
+        "targets": [{"expr": "rate(ml_inference_requests_total[5m])"}]
+      },
+      {
+        "title": "P99 Inference Latency",
+        "type": "graph",
+        "targets": [{"expr": "histogram_quantile(0.99, rate(ml_inference_duration_seconds_bucket[5m]))"}]
+      },
+      {
+        "title": "Model Accuracy (last hour)",
+        "type": "stat",
+        "targets": [{"expr": "ml_model_accuracy"}]
+      },
+      {
+        "title": "Data Drift Score by Feature",
+        "type": "bar",
+        "targets": [{"expr": "ml_data_drift_score"}]
+      },
+      {
+        "title": "Prediction Confidence Distribution",
+        "type": "histogram",
+        "targets": [{"expr": "rate(ml_prediction_confidence_bucket[5m])"}]
+      }
+    ]
+  }
+}
+```
+
+### AlertManager Rules
+```yaml
+# alerting-rules.yml
+groups:
+- name: ml-model-alerts
+  rules:
+  - alert: HighInferenceLatency
+    expr: histogram_quantile(0.99, rate(ml_inference_duration_seconds_bucket[5m])) > 1.0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "P99 inference latency exceeds 1 second"
+      description: "Model {{ $labels.model_version }} P99 latency is {{ $value }}s"
+
+  - alert: ModelAccuracyDegradation
+    expr: ml_model_accuracy < 0.80
+    for: 10m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Model accuracy dropped below 80%"
+
+  - alert: DataDriftDetected
+    expr: ml_data_drift_score > 0.3
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Significant data drift detected in feature {{ $labels.feature_name }}"
+
+  - alert: HighErrorRate
+    expr: rate(ml_inference_requests_total{status="error"}[5m]) / rate(ml_inference_requests_total[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Model error rate exceeds 5%"
+```
+
+## Great Expectations for Data Quality
+
+```python
+import great_expectations as gx
+from great_expectations.core.batch import RuntimeBatchRequest
+
+context = gx.get_context()
+
+# Create expectation suite
+suite = context.add_or_update_expectation_suite("ml_training_data")
+
+# Connect to data
+datasource = context.sources.add_pandas("pandas_datasource")
+data_asset = datasource.add_dataframe_asset("training_data")
+batch_request = data_asset.build_batch_request(dataframe=df)
+
+validator = context.get_validator(batch_request=batch_request, expectation_suite_name="ml_training_data")
+
+# Define expectations
+validator.expect_column_to_exist("feature_1")
+validator.expect_column_values_to_not_be_null("feature_1")
+validator.expect_column_values_to_be_between("age", min_value=0, max_value=120)
+validator.expect_column_values_to_be_in_set("category", value_set=["A", "B", "C"])
+validator.expect_column_mean_to_be_between("income", min_value=20000, max_value=200000)
+validator.expect_column_stdev_to_be_between("income", min_value=5000, max_value=50000)
+validator.expect_table_row_count_to_be_between(min_value=1000, max_value=10000000)
+
+validator.save_expectation_suite()
+
+# Run checkpoint
+checkpoint = context.add_or_update_checkpoint(
+    name="ml_data_checkpoint",
+    validations=[{
+        "batch_request": batch_request,
+        "expectation_suite_name": "ml_training_data"
+    }]
+)
+results = checkpoint.run()
+assert results.success, "Data quality check failed!"
+```
+
+## Automated Retraining Triggers
+
+```python
+import boto3
+from datetime import datetime, timedelta
+
+class AutoRetrainingSystem:
+    def __init__(self, drift_threshold=0.2, accuracy_threshold=0.85):
+        self.drift_threshold = drift_threshold
+        self.accuracy_threshold = accuracy_threshold
+        self.cloudwatch = boto3.client('cloudwatch')
+        self.sagemaker = boto3.client('sagemaker')
+
+    def check_drift_and_trigger_retraining(self, model_name):
+        # Get current drift score from CloudWatch
+        response = self.cloudwatch.get_metric_statistics(
+            Namespace='MLMonitoring',
+            MetricName='DataDriftScore',
+            Dimensions=[{'Name': 'ModelName', 'Value': model_name}],
+            StartTime=datetime.now() - timedelta(hours=24),
+            EndTime=datetime.now(),
+            Period=3600,
+            Statistics=['Average']
+        )
+
+        drift_score = max([dp['Average'] for dp in response['Datapoints']], default=0)
+
+        if drift_score > self.drift_threshold:
+            print(f"Drift score {drift_score:.3f} exceeds threshold {self.drift_threshold}. Triggering retraining.")
+            self._trigger_retraining_pipeline(model_name, reason=f"drift_score={drift_score:.3f}")
+
+    def _trigger_retraining_pipeline(self, model_name, reason):
+        # Start SageMaker Pipeline execution
+        self.sagemaker.start_pipeline_execution(
+            PipelineName=f"{model_name}-retraining-pipeline",
+            PipelineExecutionDisplayName=f"auto-retrain-{datetime.now().strftime('%Y%m%d-%H%M')}",
+            PipelineParameters=[
+                {'Name': 'TriggerReason', 'Value': reason},
+                {'Name': 'ModelName', 'Value': model_name}
+            ]
+        )
+
+# Schedule this to run hourly
+scheduler = AutoRetrainingSystem(drift_threshold=0.25, accuracy_threshold=0.82)
+scheduler.check_drift_and_trigger_retraining("customer-churn-model")
+```
+
+## Canary and Shadow Deployments for Safe Rollouts
+
+```python
+# Canary deployment — serve new model to 10% of traffic
+class CanaryRouter:
+    def __init__(self, champion_model, challenger_model, challenger_weight=0.1):
+        self.champion = champion_model
+        self.challenger = challenger_model
+        self.challenger_weight = challenger_weight
+
+    def route_request(self, request):
+        import random
+        if random.random() < self.challenger_weight:
+            result = self.challenger.predict(request)
+            self._log_prediction(result, model_type="challenger")
+        else:
+            result = self.champion.predict(request)
+            self._log_prediction(result, model_type="champion")
+        return result
+
+    def promote_challenger(self):
+        self.champion = self.challenger
+        self.challenger_weight = 0.0
+        print("Challenger promoted to champion!")
+```
+
+## MLflow Model Registry with Monitoring
+
+```python
+import mlflow
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient()
+
+# Set model tags with monitoring thresholds
+client.set_model_version_tag("MyModel", "1", "accuracy_threshold", "0.85")
+client.set_model_version_tag("MyModel", "1", "drift_threshold", "0.2")
+client.set_model_version_tag("MyModel", "1", "latency_sla_ms", "100")
+
+# Automated model health check
+def check_model_health(model_name, version):
+    model_version = client.get_model_version(model_name, version)
+    tags = model_version.tags
+
+    accuracy_threshold = float(tags.get("accuracy_threshold", 0.8))
+    current_accuracy = get_current_model_accuracy(model_name)
+
+    if current_accuracy < accuracy_threshold:
+        client.transition_model_version_stage(
+            name=model_name,
+            version=version,
+            stage="Archived",
+            archive_existing_versions=False
+        )
+        print(f"Model {model_name} v{version} archived due to accuracy degradation: {current_accuracy:.3f}")
+        trigger_retraining(model_name)
+```
+
+## Best Practices
+
+1. Monitor both data quality and model performance — they're both early warning systems
+2. Set up alerts before deploying to production, not after an incident
+3. Store all prediction inputs and outputs for retrospective analysis
+4. Use statistical tests (KS, PSI, MMD) for rigorous drift detection, not just visual inspection
+5. Implement shadow mode testing before promoting new models
+6. Track feature importance changes alongside accuracy metrics
+7. Set SLOs for inference latency and establish error budget policies
+8. Automate retraining triggers but require human approval for production promotions
+9. Store monitoring baselines in version control alongside model artifacts
+10. Create runbooks for each alert type so on-call engineers know how to respond
